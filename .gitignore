@@ -1,0 +1,17 @@
+/build/
+/dist/
+/symbols/
+/analysis/
+/.verify-sections/
+/manifest-check/
+/unity-installer-payload/
+/UnityEditor-*/
+/UnitySetup*.exe
+/tools/Il2CppDumper/Output/
+/tools/UnitySetup*.exe
+/*.elf
+/*.nacp
+/*.nro
+/*.map
+*.log
+__pycache__/
