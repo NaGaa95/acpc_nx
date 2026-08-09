@@ -5,6 +5,7 @@
 #include <string.h>
 #include <switch.h>
 #include <GLES3/gl3.h>
+#include "util.h"
 #include "config.h"
 
 typedef struct ANativeWindow ANativeWindow;
@@ -145,6 +146,9 @@ static int   g_cursor_shown = 0;
 
 void android_native_input_init(void){
   padConfigureInput(1, HidNpadStyleSet_NpadStandard);
+  Result rc = hidSetNpadJoyHoldType(HidNpadJoyHoldType_Vertical);
+  if (R_FAILED(rc))
+    printf_fake("[hid] WARNING: failed to set vertical Joy-Con hold type: 0x%x\n", rc);
   padInitializeDefault(&g_pad);
   hidInitializeTouchScreen();
   g_cursor_x = g_last_tx = (float)g_w * 0.5f;
@@ -186,11 +190,27 @@ void android_native_feed_hid(inject_fn inject, void *env, void *thiz){
     return;
   }
 
-  /* Docked left-stick cursor. */
-  HidAnalogStickState ls = padGetStickPos(&g_pad, 0);
+  /* A single right Joy-Con reports its stick as the right stick; all full
+   * controllers and left/dual Joy-Cons use the left stick. */
+  u32 style = padGetStyleSet(&g_pad);
+  int right_joy_only = (style & HidNpadStyleTag_NpadJoyRight) &&
+                       !(style & (HidNpadStyleTag_NpadFullKey |
+                                  HidNpadStyleTag_NpadHandheld |
+                                  HidNpadStyleTag_NpadJoyDual |
+                                  HidNpadStyleTag_NpadJoyLeft));
+  HidAnalogStickState ls = padGetStickPos(&g_pad, right_joy_only ? 1 : 0);
   float sx = (ls.x / 32767.0f) * 14.0f, sy = (ls.y / 32767.0f) * 14.0f;
-  if (config.portrait == 2) { g_cursor_x += sy; g_cursor_y += sx; }
-  else                      { g_cursor_x -= sy; g_cursor_y -= sx; }
+  if (padIsHandheld(&g_pad)) {
+    /* Attached Joy-Cons rotate with the display, so convert their axes through
+     * the same portrait transform used by the compositor. */
+    if (config.portrait == 2) { g_cursor_x += sy; g_cursor_y += sx; }
+    else                      { g_cursor_x -= sy; g_cursor_y -= sx; }
+  } else {
+    /* Detached vertical Joy-Cons and external controllers already use portrait
+     * axes. Rotating those inputs a second time is what inverted the cursor. */
+    g_cursor_x += sx;
+    g_cursor_y -= sy;
+  }
   if (g_cursor_x < 0) g_cursor_x = 0;
   if (g_cursor_x > g_w) g_cursor_x = g_w;
   if (g_cursor_y < 0) g_cursor_y = 0;

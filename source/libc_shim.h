@@ -122,6 +122,7 @@ int madvise_fake(void *addr, size_t len, int advice);
 
 // fd routing (fake pipe vs real files)
 long read_fake(int fd, void *buf, size_t count);
+long pread_fake(int fd, void *buf, size_t count, long offset);
 long z_lseek(int fd, long off, int whence);   /* real lseek; also services lseek64 */
 long write_fake(int fd, const void *buf, size_t count);
 void regular_file_io_lock(void);

@@ -19,4 +19,3 @@ void install_bionic_tls(void *buf) {
   memset(buf, 0, BIONIC_TLS_SIZE);
   armSetTlsRw((uint8_t *)buf + BIONIC_TLS_TP_OFFSET);
 }
-

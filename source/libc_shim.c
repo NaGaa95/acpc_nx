@@ -24,6 +24,7 @@
 #include <sys/stat.h>
 #include <sys/socket.h>
 #include <sys/select.h>
+#include <sys/ioctl.h>
 #include <netinet/in.h>
 #include <netdb.h>
 #include <arpa/inet.h>
@@ -42,7 +43,6 @@
 /* Only socket_fake descriptors enter Horizon BSD calls. */
 #define NX_TRACKED_NET_FDS 1024
 static uint8_t g_tracked_net_fd[NX_TRACKED_NET_FDS];
-static uint8_t g_connected_net_fd[NX_TRACKED_NET_FDS];
 static uint8_t g_nonblock_net_fd[NX_TRACKED_NET_FDS];
 static int nx_net_fd_is_tracked(int fd) {
   return fd >= 0 && fd < NX_TRACKED_NET_FDS && g_tracked_net_fd[fd];
@@ -51,17 +51,57 @@ static void nx_net_fd_set_tracked(int fd, int tracked) {
   if (fd >= 0 && fd < NX_TRACKED_NET_FDS) {
     g_tracked_net_fd[fd] = tracked ? 1 : 0;
     if (!tracked) {
-      g_connected_net_fd[fd] = 0;
       g_nonblock_net_fd[fd] = 0;
     }
   }
 }
+
+/* Android/Bionic uses Linux errno values, while libnx/newlib uses BSD-derived
+ * values for most socket errors. Translate errors before returning to the
+ * Android binaries; in particular, newlib EINPROGRESS=119 is Bionic 115. */
+static int nx_net_errno_to_bionic(int value) {
+  switch (value) {
+    case ENOTSOCK:       return 88;
+    case EDESTADDRREQ:   return 89;
+    case EMSGSIZE:       return 90;
+    case EPROTOTYPE:     return 91;
+    case ENOPROTOOPT:    return 92;
+    case EPROTONOSUPPORT:return 93;
+    case EAFNOSUPPORT:   return 97;
+    case EADDRINUSE:     return 98;
+    case EADDRNOTAVAIL:  return 99;
+    case ENETDOWN:       return 100;
+    case ENETUNREACH:    return 101;
+    case ENETRESET:      return 102;
+    case ECONNABORTED:   return 103;
+    case EISCONN:        return 106;
+    case ENOTCONN:       return 107;
+    case ETIMEDOUT:      return 110;
+    case EHOSTDOWN:      return 112;
+    case EHOSTUNREACH:   return 113;
+    case EALREADY:       return 114;
+    case EINPROGRESS:    return 115;
+    case ENOTSUP:        return 95;
+    default:             return value;
+  }
+}
+
+static int nx_net_int_result(int result) {
+  if (result < 0) errno = nx_net_errno_to_bionic(errno);
+  return result;
+}
+
+static long nx_net_long_result(long result) {
+  if (result < 0) errno = nx_net_errno_to_bionic(errno);
+  return result;
+}
+
 static int nx_net_fd_apply_nonblock(int fd) {
   int flags = fcntl(fd, F_GETFL);
-  if (flags < 0) return -1;
+  if (flags < 0) return nx_net_int_result(-1);
   if (g_nonblock_net_fd[fd]) flags |= O_NONBLOCK;
   else flags &= ~O_NONBLOCK;
-  return fcntl(fd, F_SETFL, flags);
+  return nx_net_int_result(fcntl(fd, F_SETFL, flags));
 }
 
 /* Fortify wrappers ignore object-size arguments. */
@@ -99,11 +139,7 @@ int   __open_2_fake(const char *path, int flags) { return open_fake(path, flags)
 long  __read_chk_fake(int fd, void *buf, size_t count, size_t buflen) { (void)buflen; return read(fd, buf, count); }
 long  __pread_chk_fake(int fd, void *buf, size_t count, long off, size_t buflen) {
   (void)buflen;
-  long cur = lseek(fd, 0, SEEK_CUR);
-  if (cur < 0 || lseek(fd, off, SEEK_SET) < 0) return -1;
-  long r = read(fd, buf, count);
-  lseek(fd, cur, SEEK_SET);
-  return r;
+  return pread_fake(fd, buf, count, off);
 }
 void  __FD_SET_chk_fake(int fd, void *set, size_t setlen) { (void)setlen; if (set && fd >= 0 && fd < 1024) ((unsigned long *)set)[fd / (8 * sizeof(long))] |= (1ul << (fd % (8 * sizeof(long)))); }
 int   __FD_ISSET_chk_fake(int fd, const void *set, size_t setlen) { (void)setlen; if (set && fd >= 0 && fd < 1024) return (((const unsigned long *)set)[fd / (8 * sizeof(long))] >> (fd % (8 * sizeof(long)))) & 1; return 0; }
@@ -303,6 +339,7 @@ void sincosf_fake(float x, float *s, float *c) { *s = sinf(x); *c = cosf(x); }
 int sched_get_priority_max_fake(int policy) { (void)policy; return 0; }
 int sched_get_priority_min_fake(int policy) { (void)policy; return 0; }
 void android_set_abort_message_fake(const char *msg) { (void)msg; }
+
 size_t __ctype_get_mb_cur_max_fake(void) { return 1; }
 int __register_atfork_fake(void) { return 0; }
 int __cxa_thread_atexit_impl_fake(void (*fn)(void *), void *arg, void *dso) { (void)fn; (void)arg; (void)dso; return 0; }
@@ -977,28 +1014,72 @@ static struct { void *ptr; size_t len; } g_fb[MMAP_FALLBACK_MAX];
 static int   g_fb_n = 0;
 static Mutex g_fb_lock;
 
+static void mmap_fill_file(void *dst, size_t length, int fd, long offset) {
+  size_t got = 0;
+  if (fd >= 0) {
+    while (got < length) {
+      long r = pread_fake(fd, (char *)dst + got, length - got,
+                          offset + (long)got);
+      if (r <= 0) break;
+      if ((size_t)r > length - got) r = (long)(length - got);
+      got += (size_t)r;
+    }
+  }
+  if (got < length) memset((char *)dst + got, 0, length - got);
+}
+
 static void *mmap_fallback(size_t length, int flags, int fd, long offset) {
   /* Unity dynamic heaps require MMAP_BIG_ALIGN alignment. */
   size_t align = (length >= MMAP_BIG_THRESH && (flags & BIONIC_MAP_ANONYMOUS))
                    ? MMAP_BIG_ALIGN : MMAP_PAGE;
   void *q = memalign(align, length);
   if (!q) return NULL;
-  long got = 0;
   if (flags & BIONIC_MAP_ANONYMOUS) {
     memset(q, 0, length);
   } else {
-    if (fd >= 0) {
-      long cur = lseek(fd, 0, SEEK_CUR);
-      if (lseek(fd, offset, SEEK_SET) >= 0)
-        while ((size_t)got < length) { long r = read(fd, (char *)q + got, length - got); if (r <= 0) break; got += r; }
-      if (cur >= 0) lseek(fd, cur, SEEK_SET);
-    }
-    if ((size_t)got < length) memset((char *)q + got, 0, length - got);
+    mmap_fill_file(q, length, fd, offset);
   }
+  int tracked = 0;
   mutexLock(&g_fb_lock);
-  if (g_fb_n < MMAP_FALLBACK_MAX) { g_fb[g_fb_n].ptr = q; g_fb[g_fb_n].len = length; g_fb_n++; }
+  if (g_fb_n < MMAP_FALLBACK_MAX) {
+    g_fb[g_fb_n].ptr = q;
+    g_fb[g_fb_n].len = length;
+    g_fb_n++;
+    tracked = 1;
+  }
   mutexUnlock(&g_fb_lock);
+  if (!tracked) {
+    free(q);
+    errno = ENOMEM;
+    return NULL;
+  }
   return q;
+}
+
+/* Keep large AssetBundle mappings out of the ordinary C heap. The initial
+ * content install can have more than MMAP_FIXED_BYTES mapped at once; using
+ * malloc for that overflow starves JNI and other small native allocations.
+ * The sparse pool is page-backed, recycled by munmap, and already reserved
+ * for Unity's large mappings. */
+static void *mmap_sparse_file(size_t length, int fd, long offset) {
+  if (!oc_pages || fd < 0 || length < MMAP_SPARSE_COMMIT_THRESH) return NULL;
+
+  void *p = NULL;
+  size_t reserved = 0;
+  const size_t need = (length + MMAP_PAGE - 1) / MMAP_PAGE;
+  mutexLock(&g_mmap_lock);
+  if (need <= oc_pool_available_locked()) {
+    p = oc_alloc_locked(length, &reserved);
+    if (p && reserved < length) {
+      oc_free_locked(p, reserved);
+      p = NULL;
+    }
+    if (p) oc_commit_locked(p, length);
+  }
+  mutexUnlock(&g_mmap_lock);
+
+  if (p) mmap_fill_file(p, length, fd, offset);
+  return p;
 }
 
 /* Free a tracked heap-backed mapping. */
@@ -1014,29 +1095,6 @@ static int mmap_fallback_free(void *addr) {
   }
   mutexUnlock(&g_fb_lock);
   return 0;
-}
-
-/* Deduplicate pinned read-only module mappings. */
-#define MAPC_N 24
-static struct { uint64_t ino; long off; size_t len; void *ptr; } g_mapc[MAPC_N];
-static int g_mapc_n = 0;
-static void *mapcache_get(uint64_t ino, long off, size_t len) {
-  void *r = NULL;
-  mutexLock(&g_fb_lock);
-  for (int i = 0; i < g_mapc_n; i++)
-    if (g_mapc[i].ino == ino && g_mapc[i].off == off && g_mapc[i].len == len) { r = g_mapc[i].ptr; break; }
-  mutexUnlock(&g_fb_lock);
-  return r;
-}
-static void mapcache_put(uint64_t ino, long off, size_t len, void *ptr) {
-  mutexLock(&g_fb_lock);
-  if (g_mapc_n < MAPC_N) {
-    for (int i = 0; i < g_fb_n; i++)
-      if (g_fb[i].ptr == ptr) { g_fb[i] = g_fb[--g_fb_n]; break; }
-    g_mapc[g_mapc_n].ino = ino; g_mapc[g_mapc_n].off = off;
-    g_mapc[g_mapc_n].len = len; g_mapc[g_mapc_n].ptr = ptr; g_mapc_n++;
-  }
-  mutexUnlock(&g_fb_lock);
 }
 
 /* MAP_FIXED must replace Boehm reservations in place and return the same address. */
@@ -1135,12 +1193,14 @@ void *mmap_fake(void *addr, size_t length, int prot, int flags, int fd, long off
     p = NULL;
   }
   if (!p) {
-    /* Use the heap when both fixed arenas are full. */
-    int ro_file = fd >= 0 && !(flags & BIONIC_MAP_ANONYMOUS) && !(prot & BIONIC_PROT_WRITE);
-    uint64_t mino = (ro_file && fd < FD_INO_MAX) ? g_fd_ino[fd] : 0;
-    if (mino) { void *hit = mapcache_get(mino, offset, length); if (hit) return hit; }
+    if (!(flags & BIONIC_MAP_ANONYMOUS) && fd >= 0) {
+      void *q = mmap_sparse_file(length, fd, offset);
+      if (q) return q;
+    }
+    /* Use a tracked heap mapping when both fixed arenas are full. Keeping old
+     * file mappings pinned here leaks memory and can return stale bundle data. */
     void *q = mmap_fallback(length, flags, fd, offset);
-    if (q) { if (mino) mapcache_put(mino, offset, length, q); return q; }
+    if (q) return q;
     errno = ENOMEM; return (void *)-1;
   }
 
@@ -1151,19 +1211,7 @@ void *mmap_fake(void *addr, size_t length, int prot, int flags, int fd, long off
     memset(p, 0, fill);
   } else {
     /* Load file-backed mappings into memory. */
-    long got = 0;
-    if (fd >= 0) {
-      long cur = lseek(fd, 0, SEEK_CUR);
-      if (lseek(fd, offset, SEEK_SET) >= 0) {
-        while ((size_t)got < fill) {
-          long r = read(fd, (char *)p + got, fill - (size_t)got);
-          if (r <= 0) break;
-          got += r;
-        }
-      }
-      if (cur >= 0) lseek(fd, cur, SEEK_SET);
-    }
-    if ((size_t)got < fill) memset((char *)p + got, 0, fill - (size_t)got);
+    mmap_fill_file(p, fill, fd, offset);
   }
   return p;
 }
@@ -1334,22 +1382,71 @@ static Mutex g_regular_file_io_lock;
 void regular_file_io_lock(void) { mutexLock(&g_regular_file_io_lock); }
 void regular_file_io_unlock(void) { mutexUnlock(&g_regular_file_io_lock); }
 
-long read_fake(int fd, void *buf, size_t count) {
-  if (fakefd_is_fake(fd)) return fakefd_read(fd, buf, count);
-  /* Fill reads that fsdev returns short. */
+long pread_fake(int fd, void *buf, size_t count, long offset) {
+  if (count == 0) return 0;
+
   size_t total = 0;
-  while (total < count) {
+  int failure_errno = 0;
+  regular_file_io_lock();
+  long current = lseek(fd, 0, SEEK_CUR);
+  if (current < 0) {
+    failure_errno = errno ? errno : EIO;
+  } else if (lseek(fd, (off_t)offset, SEEK_SET) < 0) {
+    failure_errno = errno ? errno : EIO;
+  }
+  while (!failure_errno && total < count) {
     long r = read(fd, (char *)buf + total, count - total);
-    if (r < 0) { if (total) break; return -1; }
+    if (r < 0) {
+      if (errno == EINTR) continue;
+      failure_errno = errno ? errno : EIO;
+      break;
+    }
     if (r == 0) break;
     total += (size_t)r;
+  }
+  if (current >= 0 && lseek(fd, current, SEEK_SET) < 0 && !failure_errno)
+    failure_errno = errno ? errno : EIO;
+  regular_file_io_unlock();
+
+  if (failure_errno) {
+    errno = failure_errno;
+    if (!total) return -1;
+  }
+  return (long)total;
+}
+
+long read_fake(int fd, void *buf, size_t count) {
+  if (fakefd_is_fake(fd)) return fakefd_read(fd, buf, count);
+  /* Socket reads must return the bytes currently available; waiting to fill a
+   * caller's whole buffer can deadlock Unity's network worker. */
+  if (nx_net_fd_is_tracked(fd))
+    return nx_net_long_result(read(fd, buf, count));
+  /* Fill regular-file reads that fsdev returns short. */
+  size_t total = 0;
+  int failure_errno = 0;
+  regular_file_io_lock();
+  while (total < count) {
+    long r = read(fd, (char *)buf + total, count - total);
+    if (r < 0) {
+      if (errno == EINTR) continue;
+      failure_errno = errno ? errno : EIO;
+      break;
+    }
+    if (r == 0) break;
+    total += (size_t)r;
+  }
+  regular_file_io_unlock();
+  if (failure_errno) {
+    errno = failure_errno;
+    if (!total) return -1;
   }
   return (long)total;
 }
 long write_fake(int fd, const void *buf, size_t count) {
   if (fakefd_is_fake(fd)) return fakefd_write(fd, buf, count);
   /* Complete regular-file writes; preserve short nonblocking socket writes. */
-  if (nx_net_fd_is_tracked(fd)) return write(fd, buf, count);
+  if (nx_net_fd_is_tracked(fd))
+    return nx_net_long_result(write(fd, buf, count));
   size_t total = 0;
   int failure_errno = 0;
   regular_file_io_lock();
@@ -1374,10 +1471,12 @@ long write_fake(int fd, const void *buf, size_t count) {
   return (long)total;
 }
 int close_fake(int fd) {
+  int network_fd = nx_net_fd_is_tracked(fd);
   fd_ino_clear(fd);
   nx_net_fd_set_tracked(fd, 0);
   if (fakefd_is_fake(fd)) return fakefd_close(fd);
-  return close(fd);
+  int result = close(fd);
+  return network_fd ? nx_net_int_result(result) : result;
 }
 int fcntl_fake(int fd, int cmd, ...) {
   if (!nx_net_fd_is_tracked(fd)) return 0; /* preserve Android-host shim */
@@ -1390,8 +1489,7 @@ int fcntl_fake(int fd, int cmd, ...) {
     int flags = va_arg(ap, int);
     va_end(ap);
     g_nonblock_net_fd[fd] = (flags & 0x800) != 0;
-    if (g_connected_net_fd[fd] && nx_net_fd_apply_nonblock(fd) < 0)
-      return -1;
+    if (nx_net_fd_apply_nonblock(fd) < 0) return -1;
     return 0;
   }
   return 0;
@@ -1401,20 +1499,16 @@ int ioctl_fake(int fd, unsigned long req, ...) {
   va_start(ap, req);
   void *arg = va_arg(ap, void *);
   va_end(ap);
-  if (!nx_net_fd_is_tracked(fd)) {
-    errno = ENOTTY;
-    return -1;
-  }
+  if (!nx_net_fd_is_tracked(fd)) { errno = ENOTTY; return -1; }
 
   if (req == 0x5421ul) { /* Android FIONBIO */
     g_nonblock_net_fd[fd] = arg && *(const int *)arg;
-    if (g_connected_net_fd[fd] && nx_net_fd_apply_nonblock(fd) < 0)
-      return -1;
+    if (nx_net_fd_apply_nonblock(fd) < 0) return -1;
     return 0;
   }
   if (req == 0x541bul) { /* Android FIONREAD */
-    if (arg) *(int *)arg = 0;
-    return 0;
+    if (!arg) { errno = EFAULT; return -1; }
+    return nx_net_int_result(ioctl(fd, FIONREAD, arg));
   }
   return 0;
 }
@@ -1436,11 +1530,13 @@ int poll_fake(void *fds, unsigned long nfds, int timeout) {
   }
   int rc = poll(native_fds, (nfds_t)nfds, timeout);
   if (rc >= 0) {
-    for (unsigned long i = 0; i < nfds; i++)
-      if (nx_net_fd_is_tracked(p[i].fd)) p[i].revents = native_fds[i].revents;
+    for (unsigned long i = 0; i < nfds; i++) {
+      if (nx_net_fd_is_tracked(p[i].fd))
+        p[i].revents = native_fds[i].revents;
+    }
   }
   free(native_fds);
-  return rc;
+  return nx_net_int_result(rc);
 }
 int select_fake(int n, void *r, void *w, void *e, void *t) {
   fd_set *rf = (fd_set *)r, *wf = (fd_set *)w, *ef = (fd_set *)e;
@@ -1468,7 +1564,7 @@ int select_fake(int n, void *r, void *w, void *e, void *t) {
 
   int rc = select(maxfd + 1, rf ? &native_r : NULL, wf ? &native_w : NULL,
                   ef ? &native_e : NULL, (struct timeval *)t);
-  if (rc < 0) return rc;
+  if (rc < 0) return nx_net_int_result(rc);
   for (int fd = 0; fd <= maxfd; fd++) {
     if (rf && FD_ISSET(fd, &native_r)) FD_SET(fd, rf);
     if (wf && FD_ISSET(fd, &native_w)) FD_SET(fd, wf);
@@ -1557,72 +1653,76 @@ static int nx_msg_flags_from_bionic(int flags) {
 int socket_fake(int d, int t, int p) {
   /* Official endpoints use translated IPv4 sockets. */
   if (d != 2 /* Android AF_INET */) {
-    errno = EAFNOSUPPORT;
+    errno = 97; /* Android EAFNOSUPPORT */
     return -1;
   }
   int native_type = t & 0xf;
   int fd = socket(AF_INET, native_type, p);
   nx_net_fd_set_tracked(fd, fd >= 0);
-  return fd;
+  return nx_net_int_result(fd);
 }
 int connect_fake(int s, const void *a, unsigned l) {
   struct sockaddr_in n;
-  if (!nx_bionic_addr_to_native(a, l, &n)) return -1;
-  int rc = connect(s, (const struct sockaddr *)&n, sizeof n);
-  if (rc == 0 && s >= 0 && s < NX_TRACKED_NET_FDS) {
-    g_connected_net_fd[s] = 1;
-    if (g_nonblock_net_fd[s]) (void)nx_net_fd_apply_nonblock(s);
-  }
-  return rc;
+  if (!nx_bionic_addr_to_native(a, l, &n))
+    return nx_net_int_result(-1);
+  return nx_net_int_result(connect(s, (const struct sockaddr *)&n, sizeof n));
 }
 int bind_fake(int s, const void *a, unsigned l) {
   struct sockaddr_in n;
-  if (!nx_bionic_addr_to_native(a, l, &n)) return -1;
-  return bind(s, (const struct sockaddr *)&n, sizeof n);
+  if (!nx_bionic_addr_to_native(a, l, &n))
+    return nx_net_int_result(-1);
+  return nx_net_int_result(bind(s, (const struct sockaddr *)&n, sizeof n));
 }
-int listen_fake(int s, int b) { return listen(s, b); }
+int listen_fake(int s, int b) { return nx_net_int_result(listen(s, b)); }
 int accept_fake(int s, void *a, void *l) {
   struct sockaddr_storage n;
   socklen_t nl = sizeof n;
   int fd = accept(s, (struct sockaddr *)&n, a ? &nl : NULL);
-  if (fd < 0) return fd;
+  if (fd < 0) return nx_net_int_result(fd);
   nx_net_fd_set_tracked(fd, 1);
-  if (fd < NX_TRACKED_NET_FDS) g_connected_net_fd[fd] = 1;
   if (!a || !l) return fd;
   unsigned bl = *(unsigned *)l;
   if (!nx_native_addr_to_bionic((const struct sockaddr *)&n,
                                 (struct BionicSockaddrIn *)a, &bl)) {
+    int saved_errno = errno;
     close(fd);
+    nx_net_fd_set_tracked(fd, 0);
+    errno = nx_net_errno_to_bionic(saved_errno);
     return -1;
   }
   *(unsigned *)l = bl;
   return fd;
 }
 long send_fake(int s, const void *b, size_t l, int f) {
-  return send(s, b, l, nx_msg_flags_from_bionic(f));
+  return nx_net_long_result(send(s, b, l, nx_msg_flags_from_bionic(f)));
 }
 long recv_fake(int s, void *b, size_t l, int f) {
-  return recv(s, b, l, nx_msg_flags_from_bionic(f));
+  return nx_net_long_result(recv(s, b, l, nx_msg_flags_from_bionic(f)));
 }
 long sendto_fake(int s, const void *b, size_t l, int f, const void *a, unsigned al) {
   struct sockaddr_in n;
-  if (!nx_bionic_addr_to_native(a, al, &n)) return -1;
-  return sendto(s, b, l, nx_msg_flags_from_bionic(f),
-                (const struct sockaddr *)&n, sizeof n);
+  if (!nx_bionic_addr_to_native(a, al, &n))
+    return nx_net_long_result(-1);
+  return nx_net_long_result(sendto(s, b, l, nx_msg_flags_from_bionic(f),
+                                   (const struct sockaddr *)&n, sizeof n));
 }
 long recvfrom_fake(int s, void *b, size_t l, int f, void *a, void *al) {
   struct sockaddr_storage n;
   socklen_t nl = sizeof n;
   long rc = recvfrom(s, b, l, nx_msg_flags_from_bionic(f),
                      a ? (struct sockaddr *)&n : NULL, a ? &nl : NULL);
-  if (rc < 0 || !a || !al) return rc;
+  if (rc < 0) return nx_net_long_result(rc);
+  if (!a || !al) return rc;
   unsigned bl = *(unsigned *)al;
   if (!nx_native_addr_to_bionic((const struct sockaddr *)&n,
-                                (struct BionicSockaddrIn *)a, &bl)) return -1;
+                                (struct BionicSockaddrIn *)a, &bl))
+    return nx_net_long_result(-1);
   *(unsigned *)al = bl;
   return rc;
 }
-int shutdown_fake(int s, int how) { return shutdown(s, how); }
+int shutdown_fake(int s, int how) {
+  return nx_net_int_result(shutdown(s, how));
+}
 int setsockopt_fake(int s, int lv, int n, const void *v, unsigned l) {
   /* Translate socket options needed by CDN and NTP traffic. */
   if (lv == 1 /* Android SOL_SOCKET */) {
@@ -1636,7 +1736,8 @@ int setsockopt_fake(int s, int lv, int n, const void *v, unsigned l) {
       case 21: native_name = SO_SNDTIMEO; break;
       default: return 0;
     }
-    return setsockopt(s, SOL_SOCKET, native_name, v, (socklen_t)l);
+    return nx_net_int_result(
+        setsockopt(s, SOL_SOCKET, native_name, v, (socklen_t)l));
   }
   if (lv == 6 /* Android IPPROTO_TCP */ && n == 1 /* TCP_NODELAY */)
     return 0;
@@ -1658,23 +1759,30 @@ int getsockopt_fake(int s, int lv, int n, void *v, void *l) {
       case 9:  native_name = SO_KEEPALIVE; break;
       case 20: native_name = SO_RCVTIMEO; break;
       case 21: native_name = SO_SNDTIMEO; break;
-      default: errno = ENOPROTOOPT; return -1;
+      default: errno = 92 /* Android ENOPROTOOPT */; return -1;
     }
   }
   socklen_t len = *(unsigned *)l;
   int rc = getsockopt(s, native_level, native_name, v, &len);
   *(unsigned *)l = len;
-  return rc;
+  if (rc < 0) return nx_net_int_result(rc);
+  if (lv == 1 && n == 4 /* Android SO_ERROR */ && v && len >= sizeof(int)) {
+    int native_socket_error = *(int *)v;
+    *(int *)v = nx_net_errno_to_bionic(native_socket_error);
+  }
+  return 0;
 }
 int getsockname_fake(int s, void *a, void *l) {
   if (!l) { errno = EINVAL; return -1; }
   struct sockaddr_storage n;
   socklen_t nl = sizeof n;
   int rc = getsockname(s, (struct sockaddr *)&n, &nl);
-  if (rc < 0 || !a) return rc;
+  if (rc < 0) return nx_net_int_result(rc);
+  if (!a) return rc;
   unsigned bl = *(unsigned *)l;
   if (!nx_native_addr_to_bionic((const struct sockaddr *)&n,
-                                (struct BionicSockaddrIn *)a, &bl)) return -1;
+                                (struct BionicSockaddrIn *)a, &bl))
+    return nx_net_int_result(-1);
   *(unsigned *)l = bl;
   return 0;
 }
@@ -1683,19 +1791,20 @@ int getpeername_fake(int s, void *a, void *l) {
   struct sockaddr_storage n;
   socklen_t nl = sizeof n;
   int rc = getpeername(s, (struct sockaddr *)&n, &nl);
-  if (rc < 0 || !a) return rc;
+  if (rc < 0) return nx_net_int_result(rc);
+  if (!a) return rc;
   unsigned bl = *(unsigned *)l;
   if (!nx_native_addr_to_bionic((const struct sockaddr *)&n,
-                                (struct BionicSockaddrIn *)a, &bl)) return -1;
+                                (struct BionicSockaddrIn *)a, &bl))
+    return nx_net_int_result(-1);
   *(unsigned *)l = bl;
   return 0;
 }
 int getaddrinfo_fake(const char *node, const char *svc, const void *hints, void **res) {
   if (!res) return -1;
   *res = NULL;
-  if (!nx_bootstrap_host_allowed(node)) {
+  if (!nx_bootstrap_host_allowed(node))
     return -2 /* Android EAI_NONAME */;
-  }
 
   const struct BionicAddrInfo *bh = (const struct BionicAddrInfo *)hints;
   struct addrinfo nh;
@@ -1857,6 +1966,9 @@ int getrusage_fake(int who, void *usage) { (void)who; if (usage) memset(usage, 0
 static char g_dlh_default, g_dlh_unity_arcore, g_dlh_arcore_c, g_dlh_arpresto;
 static uintptr_t optional_arcore_zero(void) { return 0; }
 static intptr_t optional_arcore_fail(void) { return -1; }
+static void optional_unity_arcore_session_construct(void *permission_provider) {
+  (void)permission_provider;
+}
 static void optional_arpresto_check(void (*callback)(int, void *), void *context) {
   if (callback) callback(100 /* UnsupportedDeviceNotCapable */, context);
 }
@@ -1877,16 +1989,27 @@ const char *dlerror_fake(void) { return NULL; }
 void *dlsym_fake(void *handle, const char *symbol) {
   if (!symbol) return NULL;
   extern void *firebase_stub_lookup(const char *symbol);
+
+  /* IL2CPP can retry P/Invoke lookups through its default handle instead of
+   * the synthetic dlopen handle. Resolve the optional AR plugin by symbol so
+   * XR startup reports an unavailable device instead of throwing
+   * EntryPointNotFoundException during the boot sequence. */
+  if (!strcmp(symbol, "UnityARCore_session_construct"))
+    return (void *)&optional_unity_arcore_session_construct;
+  if (!strcmp(symbol, "ArPresto_checkApkAvailability"))
+    return (void *)&optional_arpresto_check;
+  if (!strcmp(symbol, "ArPresto_requestApkInstallation"))
+    return (void *)&optional_arpresto_install;
+  if (!strncmp(symbol, "UnityARCore_", sizeof("UnityARCore_") - 1) ||
+      !strncmp(symbol, "ArPresto_", sizeof("ArPresto_") - 1))
+    return (void *)&optional_arcore_zero;
+
   void *p = so_resolve_external(symbol);
   if (p) return p;
   uintptr_t shim = dynlib_find_export(symbol);
   if (shim) return (void *)shim;
   /* Report optional ARCore services unsupported. */
   if (handle == &g_dlh_unity_arcore || handle == &g_dlh_arpresto) {
-    if (!strcmp(symbol, "ArPresto_checkApkAvailability"))
-      return (void *)&optional_arpresto_check;
-    if (!strcmp(symbol, "ArPresto_requestApkInstallation"))
-      return (void *)&optional_arpresto_install;
     return (void *)&optional_arcore_zero;
   }
   if (handle == &g_dlh_arcore_c) {

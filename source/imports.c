@@ -504,19 +504,6 @@ static int fsync_impl(int fd) {
   return r;
 }
 static int dup2_stub(int a, int b) { (void)a; return b; }
-static long pread_impl(int fd, void *buf, size_t n, long off) {
-  long cur = lseek(fd, 0, SEEK_CUR);
-  if (cur < 0) return -1;
-  if (lseek(fd, off, SEEK_SET) < 0) return -1;
-  size_t total = 0;
-  while (total < n) {
-    long r = read(fd, (char *)buf + total, n - total);
-    if (r <= 0) break;
-    total += (size_t)r;
-  }
-  lseek(fd, cur, SEEK_SET);
-  return (long)total;
-}
 static long pwrite_impl(int fd, const void *buf, size_t n, long off) {
   size_t total = 0;
   int failure_errno = 0;
@@ -840,7 +827,7 @@ DynLibFunction dynlib_functions[] = {
   { "open", (uintptr_t)&open_fake }, { "openat", (uintptr_t)&openat_fake },
   { "close", (uintptr_t)&close_fake }, { "read", (uintptr_t)&read_fake },
   { "write", (uintptr_t)&write_fake }, { "pwrite", (uintptr_t)&pwrite_impl },
-  { "pread", (uintptr_t)&pread_impl },
+  { "pread", (uintptr_t)&pread_fake },
   { "lseek", (uintptr_t)&z_lseek }, { "pipe", (uintptr_t)&pipe_fake },
   { "poll", (uintptr_t)&poll_fake }, { "select", (uintptr_t)&select_fake },
   { "dup2", (uintptr_t)&dup2_stub }, { "fcntl", (uintptr_t)&fcntl_fake },
