@@ -26,6 +26,9 @@ ASFLAGS := $(ARCH)
 LDFLAGS  = -specs=$(DEVKITPRO)/libnx/switch.specs $(ARCH) \
            -Wl,--gc-sections,-Map,$(notdir $*.map)
 
+# Publish all EGL presentation paths, including guest import tables.
+LDFLAGS += -Wl,--wrap=eglSwapBuffers,--wrap=eglGetProcAddress,--wrap=__libnx_exit
+
 LIBS := -lSDL2 -lGLESv2 -lEGL -lglapi -ldrm_nouveau -lz -lnx -lm
 
 LIBDIRS := $(PORTLIBS) $(LIBNX)

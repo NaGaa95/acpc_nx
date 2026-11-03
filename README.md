@@ -72,3 +72,7 @@ This project has no direct affiliation with Nintendo Co., Ltd. Animal Crossing a
 No assets or program code from the original game are included in this project. We do not condone piracy and encourage users to legally own the original game.
 
 Unless specified otherwise, the source code in this repository is licensed under the MIT License. See the accompanying LICENSE file.
+
+### SaltyNX telemetry
+
+FPS and render resolution are published to SaltyNX shared memory for compatible overlays. The port continues normally when SaltyNX is not running. This reports presentation timing and resolution; it does not change the game's frame cap.

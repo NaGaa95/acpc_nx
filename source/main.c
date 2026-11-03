@@ -1,5 +1,6 @@
 /* Pocket Camp Complete Unity wrapper entry point. */
 
+#include "saltynx.h"
 #include <stdlib.h>
 #include <malloc.h>
 #include <string.h>
@@ -1014,6 +1015,8 @@ static int nx_install_unity_ca_bundle(uintptr_t ub) {
 }
 
 int main(int argc, char *argv[]) {
+  saltynx_start();
+  atexit(saltynx_stop);
   (void)argc; (void)argv;
 
   SocketInitConfig net_config = *socketGetDefaultInitConfig();
